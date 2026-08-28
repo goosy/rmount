@@ -1,47 +1,91 @@
-
 # rclone mount helpers
+# Architecture: one persistent rclone rcd daemon manages all mounts through the RC API,
+# instead of starting a separate rclone process for each mount. A single fixed port is used,
+# so rmount/rstop/rflush/rlist all call the same RC endpoint and mounts can be added or
+# removed while rcd remains running.
 $cred = Get-StoredCredential -Target rclone -ErrorAction SilentlyContinue
 if ($cred) {
     $env:RCLONE_CONFIG_PASS = $cred.GetNetworkCredential().Password
 } else {
     Write-Warning "No stored credential found for 'rclone'. Rclone config password not set."
 }
-$rc_addr_base = 5572
-$stateFile = Join-Path $env:USERPROFILE ".config/rclone_mounts.json"
-$logDir    = Join-Path $env:USERPROFILE ".config/rclone_logs"
+$rc_addr      = "127.0.0.1:5572"
+$logDir       = Join-Path $env:USERPROFILE ".config/rclone_logs"
 if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
 
-# 每个挂载实例需要独立的 rc 端口，否则第二个实例绑定时会因端口占用而启动失败
-function get_free_rc_port {
-    param([int]$StartPort = $rc_addr_base)
-    $port = $StartPort
-    while ($port -lt ($StartPort + 200)) {
-        $listener = $null
-        try {
-            $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $port)
-            $listener.Start()
-            return $port
-        } catch {
-            $port++
-        } finally {
-            if ($listener) { $listener.Stop() }
+# Always pass RC parameters as flat key=value pairs (for example,
+# vfs_cache_mode=writes and volname=xxx). Do not use the JSON form of vfsOpt/mountOpt:
+# PowerShell strips the embedded double quotes when passing arguments to native processes
+# in both Windows and Legacy PSNativeCommandArgumentPassing modes, so rclone receives
+# invalid JSON such as {CacheMode:2}.
+function rc_call {
+    param(
+        [Parameter(Mandatory)] [string]$Method,
+        [Parameter()] [string[]]$Params = @()
+    )
+    $out = & rclone rc $Method @Params --rc-addr $rc_addr 2>&1
+    $text = ($out | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0) {
+        throw $text
+    }
+    if ($text) { return ($text | ConvertFrom-Json) }
+    return $null
+}
+
+# A live RC service may already be listening on the port (for example, an old
+# `rclone mount ... --rc` process left behind after the terminal was closed without
+# calling rcd_stop). Probe the service first and adopt it if reachable instead of
+# blindly starting another process that would contend for the same port.
+function rcd_ensure {
+    try {
+        $probe = rc_call -Method "core/pid"
+        if ($probe.pid -and (Get-Process -Id $probe.pid -ErrorAction SilentlyContinue)) {
+            Write-Host "Adopted existing rc server already listening on $rc_addr (PID: $($probe.pid))."
+            Write-Warning "If that PID is an old-style 'rclone mount ... --rc' process, its own CLI mount won't show up in rlist/rstop (rclone limitation) -- only mounts added via rmount from now on will."
+            return $true
         }
-    }
-    throw "No free rc port found in range $StartPort-$($StartPort + 200)."
-}
+    } catch {}
 
-function get_rclone_state {
-    if (Test-Path $stateFile) {
+    $logFile  = Join-Path $logDir ("rcd_" + (Get-Date -Format "yyyyMMdd_HHmmss_fff") + ".log")
+    $rcd_args = @(
+        "rcd"
+        "--rc-addr", $rc_addr
+        "--rc-no-auth"
+        "--sftp-disable-hashcheck"
+        "--log-file", $logFile
+        "--log-level", "INFO"
+    )
+    $proc = Start-Process rclone -ArgumentList $rcd_args -WindowStyle Hidden -PassThru
+
+    $ready   = $false
+    $maxWait = 15
+    $waited  = 0
+    while ($waited -lt $maxWait) {
+        if (-not (Get-Process -Id $proc.Id -ErrorAction SilentlyContinue)) {
+            Write-Warning "rclone rcd exited early. Check log: $logFile"
+            break
+        }
         try {
-            $raw = Get-Content $stateFile -Raw -ErrorAction SilentlyContinue
-            if ($raw) { return $raw | ConvertFrom-Json }
+            $probe = rc_call -Method "core/pid"
+            if ($probe.pid -eq $proc.Id) {
+                $ready = $true
+                break
+            }
+            # Another process owns the port, so the new process must have failed to bind.
+            Write-Warning "Port $rc_addr is already held by PID $($probe.pid), not our new rcd (PID $($proc.Id)). Adopting the existing one instead."
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+            return $true
         } catch {}
+        Start-Sleep -Milliseconds 500
+        $waited += 0.5
     }
-    return @()
-}
+    if (-not $ready) {
+        Write-Warning "rcd not confirmed ready after ${maxWait}s. Check log: $logFile"
+        return $null
+    }
 
-function save_rclone_state($state) {
-    $state | ConvertTo-Json -Depth 10 | Set-Content $stateFile -Encoding UTF8
+    Write-Host "rclone rcd started (PID: $($proc.Id), log: $logFile)"
+    return $true
 }
 
 function rmount {
@@ -50,93 +94,54 @@ function rmount {
         [Parameter(Position=1)] $Target
     )
 
-    $state = get_rclone_state
+    if (-not (rcd_ensure)) { return }
 
-    # 清理已死进程的僵尸记录
-    $alive = @()
-    foreach ($e in $state) {
-        $p = Get-Process -Id $e.pid -ErrorAction SilentlyContinue
-        if ($p) { $alive += $e }
-    }
-    if ($alive.Count -ne $state.Count) {
-        save_rclone_state $alive
-        $state = $alive
-    }
-
-    # 阻止重复挂载同一目标
-    $dup = $state | Where-Object { $_.target -eq $Target }
-    if ($dup) {
-        Write-Warning "Target '$Target' is already mounted (PID: $($dup.pid)). Run rstop first."
+    $mounts = (rc_call -Method "mount/listmounts").mountPoints
+    if ($mounts | Where-Object { $_.MountPoint -eq $Target }) {
+        Write-Warning "Target '$Target' is already mounted. Run rstop first."
         return
     }
 
-    $thisRcAddr = "127.0.0.1:$(get_free_rc_port)"
+    try {
+        rc_call -Method "mount/mount" -Params @(
+            "fs=$Source",
+            "mountPoint=$Target",
+            "vfs_cache_mode=writes",
+            "volname=$Source"
+        ) | Out-Null
+    } catch {
+        Write-Error "Mount failed: $_"
+        return
+    }
 
-    $safeName = ($Target -replace '[:\\/]', '') + "_" + (Get-Date -Format "yyyyMMdd_HHmmss")
-    $logFile  = Join-Path $logDir "$safeName.log"
-
-    $mount_args = @(
-        "mount"
-        "$Source"
-        "$Target"
-        "--vfs-cache-mode", "writes"
-        "--rc"
-        "--rc-addr", $thisRcAddr
-        "--rc-no-auth"
-        "--sftp-disable-hashcheck"
-        "--volname", "$Source"
-        "--log-file", "$logFile"
-        "--log-level", "INFO"
-    )
-
-    $proc = Start-Process rclone -ArgumentList $mount_args -WindowStyle Hidden -PassThru
-
-    # 等待挂载真正就绪（而不是仅仅进程存在），并检测早期崩溃
-    $ready   = $false
-    $maxWait = 15
-    $waited  = 0
-    while ($waited -lt $maxWait) {
-        if (-not (Get-Process -Id $proc.Id -ErrorAction SilentlyContinue)) {
-            Write-Warning "rclone exited early. Check log: $logFile"
-            break
-        }
-        if (Test-Path $Target) {
-            $ready = $true
-            break
-        }
+    # Wait for the mount to become ready; a successful RC call does not guarantee that the volume is accessible yet.
+    $ready = $false
+    for ($i = 0; $i -lt 20; $i++) {
+        if (Test-Path $Target) { $ready = $true; break }
         Start-Sleep -Milliseconds 500
-        $waited += 0.5
     }
-
     if (-not $ready) {
-        Write-Warning "Mount not confirmed ready after ${maxWait}s. Check log: $logFile"
+        Write-Warning "Mount RC call succeeded but '$Target' not visible yet. Check rcd logs in: $logDir"
         return
     }
 
-    $newEntry = [PSCustomObject]@{
-        pid       = $proc.Id
-        source    = $Source
-        target    = $Target
-        rcAddr    = $thisRcAddr
-        logFile   = $logFile
-        mountedAt = (Get-Date -Format "o")
-    }
-
-    $state += $newEntry
-    save_rclone_state $state
-    $script:rcloneMountPid = $proc.Id
-
-    Write-Host "Mounted $Source to $Target (PID: $($proc.Id), log: $logFile)"
+    Write-Host "Mounted $Source to $Target"
 }
 
 function rlist {
-    $state = get_rclone_state
-    if (-not $state) {
-        Write-Host "No active mount records found."
+    try {
+        $rcdPid = (rc_call -Method "core/pid").pid
+    } catch {
+        Write-Host "rclone rcd is not running. No active mounts."
         return
     }
-    Write-Host "Current mount records:`n"
-    $state | Format-Table -AutoSize pid, source, target, rcAddr, mountedAt
+    $mounts = (rc_call -Method "mount/listmounts").mountPoints
+    if (-not $mounts) {
+        Write-Host "rcd is running (PID $rcdPid) but no active mounts."
+        return
+    }
+    Write-Host "Current mounts (rcd PID: $rcdPid, rcAddr: $rc_addr):`n"
+    $mounts | Format-Table -AutoSize Fs, MountPoint, MountedOn
 }
 
 function rflush {
@@ -144,59 +149,32 @@ function rflush {
         [Parameter(Position=0)] $Target
     )
 
-    $state = get_rclone_state
-    if (-not $state) {
-        Write-Host "No active mount records found."
+    try {
+        rc_call -Method "core/pid" | Out-Null
+    } catch {
+        Write-Error "rclone rcd is not running."
         return
     }
 
-    $entries = if ($Target) { $state | Where-Object { $_.target -eq $Target } } else { $state }
+    $mounts  = (rc_call -Method "mount/listmounts").mountPoints
+    $entries = if ($Target) { $mounts | Where-Object { $_.MountPoint -eq $Target } } else { $mounts }
     if (-not $entries) {
-        Write-Error "No rclone mount found for target '$Target'. Use rlist to see active mounts."
+        Write-Error "No rclone mount found$(if ($Target) { " for target '$Target'" }). Use rlist to see active mounts."
         return
     }
 
     foreach ($e in $entries) {
-        rclone rc vfs/forget --rc-addr $e.rcAddr
-        Write-Host "VFS cache flushed for $($e.target) (rcAddr: $($e.rcAddr))."
+        rc_call -Method "vfs/forget" -Params @("fs=$($e.Fs)") | Out-Null
+        Write-Host "VFS cache flushed for $($e.MountPoint) ($($e.Fs))."
     }
 }
 
-function rstop {
-    param(
-        [Parameter(Position=0)] $Target,
-        [Parameter()] $addr
-    )
+# Drain this fs's pending VFS uploads, then unmount just this one mount point.
+# The rcd daemon and any other concurrent mounts are left untouched.
+function stop_one_mount {
+    param([Parameter(Mandatory)] $Entry)
 
-    $state = get_rclone_state
-    $entry = $null
-    if ($Target) {
-        $entry = $state | Where-Object { $_.target -eq $Target } | Select-Object -First 1
-    } elseif ($addr) {
-        $entry = $state | Where-Object { $_.rcAddr -eq $addr } | Select-Object -First 1
-    } elseif ($state.Count -eq 1) {
-        $entry = $state[0]
-    }
-
-    # 如果文件记录丢失，回退到进程匹配（需要显式提供 -addr）
-    if (-not $entry -and $addr) {
-        $matched = Get-CimInstance Win32_Process -Filter "Name='rclone.exe'" -ErrorAction SilentlyContinue |
-            Where-Object { $_.CommandLine -like "*--rc-addr*${addr}*" } |
-            Select-Object -First 1
-        if ($matched) {
-            $entry = [PSCustomObject]@{ pid = $matched.ProcessId; target = "unknown"; rcAddr = $addr }
-            Write-Warning "No state file record found. Fallback to process match (PID: $($entry.pid))."
-        }
-    }
-
-    if (-not $entry) {
-        Write-Error "No rclone mount found. Specify a target (rstop Q:) or -addr <host:port>. Use rlist to see active mounts."
-        return
-    }
-
-    $addr = $entry.rcAddr
-
-    # Step 1
+    # Step 1: Wait for uploads to finish for this fs.
     $maxWait      = 60
     $waited       = 0
     $pending      = $true
@@ -204,55 +182,105 @@ function rstop {
     $maxRcRetries = 3
     while ($waited -lt $maxWait) {
         try {
-            $stats      = Invoke-RestMethod -Uri "http://$addr/vfs/stats" -Method Post -TimeoutSec 5
+            $stats      = rc_call -Method "vfs/stats" -Params @("fs=$($Entry.Fs)")
             $queued     = $stats.diskCache.uploadsQueued
             $inProgress = $stats.diskCache.uploadsInProgress
             $rcFailures = 0
         } catch {
             $rcFailures++
             if ($rcFailures -ge $maxRcRetries) {
-                Write-Warning "RC query failed $rcFailures times in a row, rclone may already be dead. Last error: $($_.Exception.Message)"
+                Write-Warning "RC query failed $rcFailures times in a row. Last error: $_"
                 $pending = $false
                 break
             }
-            Write-Warning "RC query failed (attempt $rcFailures/$maxRcRetries): $($_.Exception.Message). Retrying..."
+            Write-Warning "RC query failed (attempt $rcFailures/$maxRcRetries): $_. Retrying..."
             Start-Sleep -Seconds 1
             $waited += 1
             continue
         }
 
         if ($queued -eq 0 -and $inProgress -eq 0) {
-            Write-Host "All uploads finished."
+            Write-Host "All uploads finished for $($Entry.MountPoint)."
             $pending = $false
             break
         }
-        Write-Host "Waiting for uploads... Queued: $queued, InProgress: $inProgress"
+        Write-Host "Waiting for uploads on $($Entry.MountPoint)... Queued: $queued, InProgress: $inProgress"
         Start-Sleep -Seconds 2
         $waited += 2
     }
     if ($pending) {
-        Write-Warning "Timed out after ${maxWait}s with pending uploads."
+        Write-Warning "Timed out after ${maxWait}s with pending uploads on $($Entry.MountPoint)."
     }
 
-    # Step 2
+    # Step 2: Unmount only this mount point; keep the rcd daemon and other mounts running.
     try {
-        Invoke-RestMethod -Uri "http://$addr/core/quit" -Method Post -TimeoutSec 5 | Out-Null
-        Write-Host "Rclone mount gracefully stopped."
+        rc_call -Method "mount/unmount" -Params @("mountPoint=$($Entry.MountPoint)") | Out-Null
+        Write-Host "Unmounted $($Entry.MountPoint)."
     } catch {
-        Write-Warning "core/quit request failed: $($_.Exception.Message)"
+        Write-Error "Unmount failed for $($Entry.MountPoint): $_"
+    }
+}
+
+function rstop {
+    param(
+        [Parameter(Position=0)] $Target,
+        [switch]$All
+    )
+
+    try {
+        rc_call -Method "core/pid" | Out-Null
+    } catch {
+        Write-Error "rclone rcd is not running."
+        return
     }
 
-    # Step 3
-    Start-Sleep -Seconds 2
-    $targetPid = $entry.pid
-    $proc = Get-Process -Id $targetPid -ErrorAction SilentlyContinue
-    if ($proc) {
-        Write-Warning "Rclone still alive, forcing stop (PID: $($proc.Id))..."
-        Stop-Process -Id $proc.Id -Force
+    # Accept `rstop --all` / `rstop all` / `rstop *` in addition to the -All switch.
+    if ($Target -in '--all', '-all', 'all', '*') { $All = $true; $Target = $null }
+
+    $mounts = @((rc_call -Method "mount/listmounts").mountPoints)
+
+    if ($All) {
+        if ($mounts.Count -eq 0) { Write-Host "No active mounts to stop." }
+        foreach ($m in $mounts) { stop_one_mount $m }
+        return
     }
 
-    # Step 4
-    $cleaned = get_rclone_state | Where-Object { $_.pid -ne $targetPid }
-    save_rclone_state $cleaned
-    Write-Host "Mount record removed from state file."
+    if ($mounts.Count -eq 0) {
+        Write-Error "No active rclone mounts. Use rlist to check."
+        return
+    }
+
+    if ($Target) {
+        $entry = $mounts | Where-Object { $_.MountPoint -eq $Target } | Select-Object -First 1
+        if (-not $entry) {
+            Write-Error "No mount at '$Target'. Active: $($mounts.MountPoint -join ', '). Use rlist for details."
+            return
+        }
+    } elseif ($mounts.Count -eq 1) {
+        $entry = $mounts[0]
+    } else {
+        Write-Error "Multiple mounts active: $($mounts.MountPoint -join ', '). Specify one (rstop $($mounts[0].MountPoint)) or use rstop -All."
+        return
+    }
+
+    stop_one_mount $entry
+}
+
+function rcd_stop {
+    try {
+        $rcdPid = (rc_call -Method "core/pid").pid
+    } catch {
+        Write-Host "rclone rcd is not running."
+        return
+    }
+
+    rstop -All
+
+    try {
+        rc_call -Method "core/quit" | Out-Null
+    } catch {
+        Write-Warning "core/quit failed: $_. Forcing stop."
+        Stop-Process -Id $rcdPid -Force -ErrorAction SilentlyContinue
+    }
+    Write-Host "rclone rcd stopped."
 }
