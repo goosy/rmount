@@ -52,8 +52,8 @@ function rc_call {
 
 # A live RC service may already be listening on the port (for example, an old
 # `rclone mount ... --rc` process left behind after the terminal was closed without
-# calling rcd_stop). Probe the service first and adopt it if reachable instead of
-# blindly starting another process that would contend for the same port.
+# calling `rstop --all`). Probe the service first and adopt it if reachable instead
+# of blindly starting another process that would contend for the same port.
 function rcd_ensure {
     try {
         $probe = rc_call -Method "core/pid"
@@ -333,7 +333,7 @@ function rstop {
     )
 
     try {
-        rc_call -Method "core/pid" | Out-Null
+        $rcdPid = (rc_call -Method "core/pid").pid
     } catch {
         Write-Error "rclone rcd is not running."
         return
@@ -344,9 +344,18 @@ function rstop {
 
     $mounts = @((rc_call -Method "mount/listmounts").mountPoints)
 
+    # `rstop --all` drains and unmounts every mount, then shuts the rcd daemon down.
     if ($All) {
         if ($mounts.Count -eq 0) { Write-Host "No active mounts to stop." }
         foreach ($m in $mounts) { stop_one_mount $m }
+
+        try {
+            rc_call -Method "core/quit" | Out-Null
+        } catch {
+            Write-Warning "core/quit failed: $_. Forcing stop."
+            Stop-Process -Id $rcdPid -Force -ErrorAction SilentlyContinue
+        }
+        Write-Host "rclone rcd stopped."
         return
     }
 
@@ -369,23 +378,4 @@ function rstop {
     }
 
     stop_one_mount $entry
-}
-
-function rcd_stop {
-    try {
-        $rcdPid = (rc_call -Method "core/pid").pid
-    } catch {
-        Write-Host "rclone rcd is not running."
-        return
-    }
-
-    rstop -All
-
-    try {
-        rc_call -Method "core/quit" | Out-Null
-    } catch {
-        Write-Warning "core/quit failed: $_. Forcing stop."
-        Stop-Process -Id $rcdPid -Force -ErrorAction SilentlyContinue
-    }
-    Write-Host "rclone rcd stopped."
 }
