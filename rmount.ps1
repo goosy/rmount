@@ -13,6 +13,10 @@ $rc_addr      = "127.0.0.1:5572"
 $logDir       = Join-Path $env:USERPROFILE ".config/rclone_logs"
 if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
 
+# Tab-separated "<remote>`t<localPath>" records, one per line, appended by rmount
+# and de-duplicated so rlist history shows each remote/target pair only once.
+$historyFile  = Join-Path $env:USERPROFILE ".config/rmount_history.tsv"
+
 # Always pass RC parameters as flat key=value pairs (for example,
 # vfs_cache_mode=writes and volname=xxx). Do not use the JSON form of vfsOpt/mountOpt:
 # PowerShell strips the embedded double quotes when passing arguments to native processes
@@ -103,6 +107,26 @@ function rcd_ensure {
     return $true
 }
 
+# Append a "<remote>`t<localPath>" record to the history file, skipping it if an
+# identical pair is already present. Failures here must never break a mount.
+function add_mount_history {
+    param(
+        [Parameter(Mandatory)] [string]$Source,
+        [Parameter(Mandatory)] [string]$Target
+    )
+    try {
+        $line     = "$Source`t$Target"
+        $existing = @()
+        if (Test-Path -LiteralPath $historyFile) {
+            $existing = @(Get-Content -LiteralPath $historyFile -ErrorAction Stop | Where-Object { $_.Trim() })
+        }
+        if ($existing -contains $line) { return }
+        Add-Content -LiteralPath $historyFile -Value $line -Encoding UTF8
+    } catch {
+        Write-Warning "Could not update mount history ($historyFile): $_"
+    }
+}
+
 function rmount {
     param(
         [Parameter(Position=0)] $Source,
@@ -110,6 +134,11 @@ function rmount {
     )
 
     if (-not (rcd_ensure)) { return }
+
+    # Normalise path separators up front: everything downstream (the mount call,
+    # the already-mounted check, the history file) works with forward slashes.
+    if ($Source) { $Source = $Source -replace '\\', '/' }
+    if ($Target) { $Target = $Target -replace '\\', '/' }
 
     $mounts = (rc_call -Method "mount/listmounts").mountPoints
     if ($mounts | Where-Object { $_.MountPoint -eq $Target }) {
@@ -146,10 +175,13 @@ function rmount {
         return
     }
 
+    add_mount_history -Source $Source -Target $Target
     Write-Host "Mounted $Source to $Target"
 }
 
-function rlist {
+# Section 1: mounts currently served by the rcd daemon.
+function show_active_mounts {
+    Write-Host "== Active mounts =="
     try {
         $rcdPid = (rc_call -Method "core/pid").pid
     } catch {
@@ -161,8 +193,53 @@ function rlist {
         Write-Host "rcd is running (PID $rcdPid) but no active mounts."
         return
     }
-    Write-Host "Current mounts (rcd PID: $rcdPid, rcAddr: $rc_addr):`n"
-    $mounts | Format-Table -AutoSize Fs, MountPoint, MountedOn
+    Write-Host "rcd PID: $rcdPid, rcAddr: $rc_addr"
+    # Print each mount ourselves instead of Format-Table, which prepends a blank line.
+    $fsWidth = ($mounts.Fs | Measure-Object -Maximum -Property Length).Maximum
+    foreach ($m in $mounts) {
+        Write-Host ("● {0,-$fsWidth}  {1}  {2}" -f $m.Fs, $m.MountPoint, $m.MountedOn)
+    }
+}
+
+# Section 2: remotes defined in the rclone config (`rclone listremotes`).
+function show_config_remotes {
+    Write-Host "== Configured remotes (rclone config) =="
+    $remotes = @(& rclone listremotes 2>$null | Where-Object { $_.Trim() })
+    if ($LASTEXITCODE -ne 0 -or -not $remotes) {
+        Write-Host "No remotes found in rclone config."
+        return
+    }
+    $remotes | ForEach-Object { Write-Host "● $_" }
+}
+
+# Section 3: de-duplicated history of everything ever mounted via rmount.
+function show_mount_history {
+    Write-Host "== Mount history (remote_path local_path) =="
+    if (-not (Test-Path -LiteralPath $historyFile)) {
+        Write-Host "No mount history recorded yet."
+        return
+    }
+    $entries = @(Get-Content -LiteralPath $historyFile | Where-Object { $_.Trim() } | Select-Object -Unique)
+    if (-not $entries) {
+        Write-Host "No mount history recorded yet."
+        return
+    }
+    foreach ($line in $entries) {
+        $parts = $line -split "`t", 2
+        Write-Host ("● {0} {1}" -f $parts[0], $parts[1])
+    }
+}
+
+function rlist {
+    param(
+        [Parameter(Position=0)] [string]$Section
+    )
+
+    show_active_mounts
+    Write-Host ""
+    show_config_remotes
+    Write-Host ""
+    show_mount_history
 }
 
 function rflush {
