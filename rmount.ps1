@@ -23,12 +23,26 @@ function rc_call {
         [Parameter(Mandatory)] [string]$Method,
         [Parameter()] [string[]]$Params = @()
     )
-    $out = & rclone rc $Method @Params --rc-addr $rc_addr 2>&1
-    $text = ($out | Out-String).Trim()
-    if ($LASTEXITCODE -ne 0) {
-        throw $text
+    # Merge streams, then split them back apart by type: with 2>&1 a native
+    # command's stderr lines arrive as ErrorRecord objects while stdout lines
+    # stay plain strings. This keeps stray stderr (client warnings, the
+    # "NOTICE: Failed to rc:" line) out of the text we hand to ConvertFrom-Json.
+    $merged = & rclone rc $Method @Params --rc-addr $rc_addr 2>&1
+    $exit   = $LASTEXITCODE
+    $stdout = (($merged | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] }) | Out-String).Trim()
+    $stderr = (($merged | Where-Object { $_ -is    [System.Management.Automation.ErrorRecord] }) | Out-String).Trim()
+
+    if ($exit -ne 0) {
+        # On failure rclone writes a JSON error object to stdout; pull the
+        # structured .error field out of it rather than throwing the raw blob.
+        $msg = $null
+        if ($stdout) { try { $msg = ($stdout | ConvertFrom-Json).error } catch { } }
+        if (-not $msg) { $msg = (@($stdout, $stderr) | Where-Object { $_ }) -join "`n" }
+        if (-not $msg) { $msg = "rclone rc $Method failed (exit $exit)" }
+        throw $msg
     }
-    if ($text) { return ($text | ConvertFrom-Json) }
+
+    if ($stdout) { return ($stdout | ConvertFrom-Json) }
     return $null
 }
 
@@ -57,10 +71,12 @@ function rcd_ensure {
     )
     $proc = Start-Process rclone -ArgumentList $rcd_args -WindowStyle Hidden -PassThru
 
-    $ready   = $false
-    $maxWait = 15
-    $waited  = 0
-    while ($waited -lt $maxWait) {
+    # Use a real wall-clock deadline: each loop also spends ~0.3-0.5s spawning
+    # `rclone rc`, so counting only the Start-Sleep time would undershoot badly.
+    $ready    = $false
+    $maxWait  = 15
+    $deadline = (Get-Date).AddSeconds($maxWait)
+    while ((Get-Date) -lt $deadline) {
         if (-not (Get-Process -Id $proc.Id -ErrorAction SilentlyContinue)) {
             Write-Warning "rclone rcd exited early. Check log: $logFile"
             break
@@ -77,7 +93,6 @@ function rcd_ensure {
             return $true
         } catch {}
         Start-Sleep -Milliseconds 500
-        $waited += 0.5
     }
     if (-not $ready) {
         Write-Warning "rcd not confirmed ready after ${maxWait}s. Check log: $logFile"
@@ -102,12 +117,18 @@ function rmount {
         return
     }
 
+    # WinFsp volume labels can't contain ':' '/' '\' -- those get truncated or
+    # rejected -- so derive a clean label from the remote string (e.g.
+    # "gdrive:backup" -> "gdrive_backup").
+    $volName = ($Source -replace '[:/\\]', '_').Trim('_')
+    if (-not $volName) { $volName = "rclone" }
+
     try {
         rc_call -Method "mount/mount" -Params @(
             "fs=$Source",
             "mountPoint=$Target",
             "vfs_cache_mode=writes",
-            "volname=$Source"
+            "volname=$volName"
         ) | Out-Null
     } catch {
         Write-Error "Mount failed: $_"
@@ -199,6 +220,13 @@ function stop_one_mount {
             continue
         }
 
+        if ($null -eq $queued -and $null -eq $inProgress) {
+            # No disk cache for this fs (vfs_cache_mode below 'writes') -- nothing
+            # to drain. Note $null -eq 0 is $false in PowerShell, so this guard
+            # must come before the numeric check or the loop never breaks.
+            $pending = $false
+            break
+        }
         if ($queued -eq 0 -and $inProgress -eq 0) {
             Write-Host "All uploads finished for $($Entry.MountPoint)."
             $pending = $false
