@@ -17,37 +17,41 @@ if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Forc
 # and de-duplicated so rlist history shows each remote/target pair only once.
 $historyFile  = Join-Path $env:USERPROFILE ".config/rmount_history.tsv"
 
-# Always pass RC parameters as flat key=value pairs (for example,
-# vfs_cache_mode=writes and volname=xxx). Do not use the JSON form of vfsOpt/mountOpt:
-# PowerShell strips the embedded double quotes when passing arguments to native processes
-# in both Windows and Legacy PSNativeCommandArgumentPassing modes, so rclone receives
-# invalid JSON such as {CacheMode:2}.
+# Every RC operation talks to the daemon's HTTP API directly instead of shelling
+# out to `rclone rc`. This drops the ~0.3-0.5s per-call process spawn, and reads
+# the response body as UTF-8 (from the HTTP content type) rather than decoding a
+# subprocess's stdout with the console code page -- CP936/GB2312 on a zh-CN box,
+# which used to corrupt non-ASCII fields such as vfs/stats' diskCache.path and
+# break ConvertFrom-Json. Params go out as a JSON object, so pass a hashtable
+# (nested values like vfsOpt/mountOpt are fine); there is no native-argument
+# quote stripping to work around any more.
 function rc_call {
     param(
         [Parameter(Mandatory)] [string]$Method,
-        [Parameter()] [string[]]$Params = @()
+        [Parameter()] [hashtable]$Params = @{}
     )
-    # Merge streams, then split them back apart by type: with 2>&1 a native
-    # command's stderr lines arrive as ErrorRecord objects while stdout lines
-    # stay plain strings. This keeps stray stderr (client warnings, the
-    # "NOTICE: Failed to rc:" line) out of the text we hand to ConvertFrom-Json.
-    $merged = & rclone rc $Method @Params --rc-addr $rc_addr 2>&1
-    $exit   = $LASTEXITCODE
-    $stdout = (($merged | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] }) | Out-String).Trim()
-    $stderr = (($merged | Where-Object { $_ -is    [System.Management.Automation.ErrorRecord] }) | Out-String).Trim()
-
-    if ($exit -ne 0) {
-        # On failure rclone writes a JSON error object to stdout; pull the
-        # structured .error field out of it rather than throwing the raw blob.
-        $msg = $null
-        if ($stdout) { try { $msg = ($stdout | ConvertFrom-Json).error } catch { } }
-        if (-not $msg) { $msg = (@($stdout, $stderr) | Where-Object { $_ }) -join "`n" }
-        if (-not $msg) { $msg = "rclone rc $Method failed (exit $exit)" }
+    $req = @{
+        Method      = "Post"
+        Uri         = "http://$rc_addr/$Method"
+        Body        = ($Params | ConvertTo-Json -Compress)
+        ContentType = "application/json"
+        NoProxy     = $true
+    }
+    try {
+        return Invoke-RestMethod @req
+    } catch {
+        # On failure rclone answers with an HTTP error status and a JSON body
+        # carrying a structured .error field; surface that rather than the raw
+        # HttpResponseException. $_.ErrorDetails.Message holds the response body
+        # for a non-2xx reply; a transport failure (rcd not running) has none,
+        # so fall back to the exception message.
+        $msg  = $null
+        $body = $_.ErrorDetails.Message
+        if ($body) { try { $msg = ($body | ConvertFrom-Json).error } catch { } }
+        if (-not $msg) { $msg = $_.Exception.Message }
+        if (-not $msg) { $msg = "rc $Method failed" }
         throw $msg
     }
-
-    if ($stdout) { return ($stdout | ConvertFrom-Json) }
-    return $null
 }
 
 # A live RC service may already be listening on the port (for example, an old
@@ -75,8 +79,9 @@ function rcd_ensure {
     )
     $proc = Start-Process rclone -ArgumentList $rcd_args -WindowStyle Hidden -PassThru
 
-    # Use a real wall-clock deadline: each loop also spends ~0.3-0.5s spawning
-    # `rclone rc`, so counting only the Start-Sleep time would undershoot badly.
+    # Use a real wall-clock deadline rather than counting Start-Sleep time: each
+    # loop also spends time on the core/pid probe (a failing connect while rcd is
+    # still binding), so a sleep-only budget would undershoot.
     $ready    = $false
     $maxWait  = 15
     $deadline = (Get-Date).AddSeconds($maxWait)
@@ -153,12 +158,12 @@ function rmount {
     if (-not $volName) { $volName = "rclone" }
 
     try {
-        rc_call -Method "mount/mount" -Params @(
-            "fs=$Source",
-            "mountPoint=$Target",
-            "vfs_cache_mode=writes",
-            "volname=$volName"
-        ) | Out-Null
+        rc_call -Method "mount/mount" -Params @{
+            fs             = $Source
+            mountPoint     = $Target
+            vfs_cache_mode = "writes"
+            volname        = $volName
+        } | Out-Null
     } catch {
         Write-Error "Mount failed: $_"
         return
@@ -262,7 +267,7 @@ function rflush {
     }
 
     foreach ($e in $entries) {
-        rc_call -Method "vfs/forget" -Params @("fs=$($e.Fs)") | Out-Null
+        rc_call -Method "vfs/forget" -Params @{ fs = $e.Fs } | Out-Null
         Write-Host "VFS cache flushed for $($e.MountPoint) ($($e.Fs))."
     }
 }
@@ -280,7 +285,7 @@ function stop_one_mount {
     $maxRcRetries = 3
     while ($waited -lt $maxWait) {
         try {
-            $stats      = rc_call -Method "vfs/stats" -Params @("fs=$($Entry.Fs)")
+            $stats      = rc_call -Method "vfs/stats" -Params @{ fs = $Entry.Fs }
             $queued     = $stats.diskCache.uploadsQueued
             $inProgress = $stats.diskCache.uploadsInProgress
             $rcFailures = 0
@@ -319,7 +324,7 @@ function stop_one_mount {
 
     # Step 2: Unmount only this mount point; keep the rcd daemon and other mounts running.
     try {
-        rc_call -Method "mount/unmount" -Params @("mountPoint=$($Entry.MountPoint)") | Out-Null
+        rc_call -Method "mount/unmount" -Params @{ mountPoint = $Entry.MountPoint } | Out-Null
         Write-Host "Unmounted $($Entry.MountPoint)."
     } catch {
         Write-Error "Unmount failed for $($Entry.MountPoint): $_"
