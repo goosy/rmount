@@ -77,38 +77,81 @@ function rcd_ensure {
         "--log-file", $logFile
         "--log-level", "INFO"
     )
-    $proc = Start-Process rclone -ArgumentList $rcd_args -WindowStyle Hidden -PassThru
+    # rcd must NOT be a direct child of this shell: a plain Start-Process makes
+    # rclone a child of the interactive pwsh, and terminal emulators that scan
+    # the shell's child-process tree when the window is closed (Tabby) then
+    # prompt to kill it, even though rcd is meant to outlive any one terminal.
+    #
+    # Preferred: Start-Detached.exe, a PATH-installed helper that reparents rcd
+    # off this shell in one CreateProcess call, inheriting this session's
+    # environment (RCLONE_CONFIG_PASS included) and printing only the new
+    # process's PID to stdout. rcd is then not our child, so its PID comes from
+    # that stdout line.
+    #
+    # Fallback (helper absent, or the process it starts fails to come up -- a
+    # reparented console program can be left without usable stdio): a
+    # `cmd /c start` trampoline. `start` launches rclone and returns, then cmd
+    # exits, so rclone's recorded parent is gone and it no longer appears under
+    # this shell; the environment block is still inherited.
+    $rcdPid = $null
 
-    # Use a real wall-clock deadline rather than counting Start-Sleep time: each
-    # loop also spends time on the core/pid probe (a failing connect while rcd is
-    # still binding), so a sleep-only budget would undershoot.
-    $ready    = $false
-    $maxWait  = 15
-    $deadline = (Get-Date).AddSeconds($maxWait)
-    while ((Get-Date) -lt $deadline) {
-        if (-not (Get-Process -Id $proc.Id -ErrorAction SilentlyContinue)) {
-            Write-Warning "rclone rcd exited early. Check log: $logFile"
-            break
-        }
+    if (Get-Command Start-Detached.exe -ErrorAction SilentlyContinue) {
+        $spawnPid = $null
         try {
-            $probe = rc_call -Method "core/pid"
-            if ($probe.pid -eq $proc.Id) {
-                $ready = $true
-                break
+            $stdout = & Start-Detached.exe -- rclone @rcd_args 2>$null
+            if ($LASTEXITCODE -eq 0 -and $stdout) {
+                $spawnPid = [int]($stdout | Select-Object -Last 1)
+            } else {
+                Write-Warning "Start-Detached.exe failed (exit $LASTEXITCODE); falling back to cmd trampoline."
             }
-            # Another process owns the port, so the new process must have failed to bind.
-            Write-Warning "Port $rc_addr is already held by PID $($probe.pid), not our new rcd (PID $($proc.Id)). Adopting the existing one instead."
-            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-            return $true
-        } catch {}
-        Start-Sleep -Milliseconds 500
+        } catch {
+            Write-Warning "Start-Detached.exe threw ($_); falling back to cmd trampoline."
+        }
+        if ($spawnPid) {
+            $deadline = (Get-Date).AddSeconds(8)
+            while ((Get-Date) -lt $deadline) {
+                if (-not (Get-Process -Id $spawnPid -ErrorAction SilentlyContinue)) { break }
+                try {
+                    $probe = rc_call -Method "core/pid"
+                    if ($probe.pid) { $rcdPid = $probe.pid; break }
+                } catch {}
+                Start-Sleep -Milliseconds 500
+            }
+            if (-not $rcdPid) {
+                Write-Warning "rcd via Start-Detached.exe did not come up; falling back to cmd trampoline. Check log: $logFile"
+                Stop-Process -Id $spawnPid -Force -ErrorAction SilentlyContinue
+            }
+        }
     }
-    if (-not $ready) {
-        Write-Warning "rcd not confirmed ready after ${maxWait}s. Check log: $logFile"
+
+    if (-not $rcdPid) {
+        $inner = ($rcd_args | ForEach-Object {
+            if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ }
+        }) -join ' '
+        Start-Process -FilePath $env:ComSpec `
+            -ArgumentList "/c start `"`" /b rclone $inner" -WindowStyle Hidden
+
+        # Wall-clock deadline rather than counting Start-Sleep time: each loop
+        # also spends time on the core/pid probe (a failing connect while rcd is
+        # still binding the port), so a sleep-only budget would undershoot. If
+        # rcd loses a port-bind race to a concurrently started one, that loser
+        # exits on its own and the incumbent answers here -- the right outcome.
+        $deadline = (Get-Date).AddSeconds(15)
+        while ((Get-Date) -lt $deadline) {
+            try {
+                $probe = rc_call -Method "core/pid"
+                if ($probe.pid) { $rcdPid = $probe.pid; break }
+            } catch {}
+            Start-Sleep -Milliseconds 500
+        }
+    }
+
+    if (-not $rcdPid) {
+        Write-Warning "rcd not confirmed ready. Check log: $logFile"
         return $null
     }
 
-    Write-Host "rclone rcd started (PID: $($proc.Id), log: $logFile)"
+    Write-Host "rclone rcd started (PID: $rcdPid, log: $logFile)"
     return $true
 }
 

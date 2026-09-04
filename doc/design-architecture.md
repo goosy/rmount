@@ -17,10 +17,9 @@ while the daemon keeps running.
   falling back to the transport exception message when there is no body (e.g. rcd not running).
   `-NoProxy` keeps the loopback call away from any configured HTTP proxy.
 - `rcd_ensure` — idempotent daemon bootstrap. Probes `core/pid` first and **adopts** an
-  already-running RC server if one answers; otherwise `Start-Process rclone rcd` and polls
-  `core/pid` against a wall-clock deadline until the new PID answers. If a different PID owns the
-  port, the freshly spawned process is killed and the existing server adopted. Called at the top
-  of `rmount`.
+  already-running RC server if one answers; otherwise starts `rclone rcd` **off this shell's
+  process tree** (see below) and polls `core/pid` against a wall-clock deadline until it
+  answers, taking whatever PID replies as the daemon's. Called at the top of `rmount`.
 - `rmount` — `rcd_ensure` → normalise separators → check `mount/listmounts` for a duplicate
   target → derive `volname` → `mount/mount` → poll `Test-Path $target` until the volume is
   visible → `add_mount_history`.
@@ -49,6 +48,26 @@ while the daemon keeps running.
 - `rcd_ensure`'s readiness loop uses a real wall-clock deadline, because each iteration also
   spends time on the `core/pid` probe (a failing connect while rcd is still binding the port);
   counting only `Start-Sleep` time would undershoot.
+- **rcd is started so it is not a child of the shell.** `Start-Process rclone` makes the daemon
+  a direct child of the interactive pwsh; terminal emulators that scan the shell's
+  child-process tree when the window is closed (Tabby) then prompt to kill it, even though rcd
+  is meant to outlive any one terminal. `rcd_ensure` handles this in two tiers:
+  - **`Start-Detached.exe`** — a PATH-installed helper (`Start-Detached -- rclone rcd ...`),
+    used when found on `PATH`. It creates rcd already reparented off this shell in one
+    `CreateProcess` call, inheriting the session environment block, and prints only the new
+    process's PID to stdout (captured and parsed as `$spawnPid`).
+  - **`cmd /c start "" /b rclone rcd ...`** (hidden) — the built-in fallback, used when
+    `Start-Detached.exe` is absent, exits non-zero, throws, or starts a process that never
+    answers `core/pid` within ~8s (a reparented console program can be left without usable
+    stdio and exit before it opens its log file). `start` launches rclone and returns, then cmd
+    exits, so rclone's recorded parent is gone and it no longer appears under the shell.
+
+  Either way rclone inherits the session environment block, so `RCLONE_CONFIG_PASS` reaches it,
+  and the daemon's PID is discovered from the `core/pid` reply rather than a `-PassThru`
+  handle. Reparenting rclone to explorer.exe via `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS` was
+  tried directly and did not work: reparented to a console-less process, rclone gets no usable
+  standard handles and exits before it can open its log file (hence the fallback trigger
+  above).
 - `stop_one_mount` retries a failed `vfs/stats` up to 3 consecutive times before giving up, so a
   transient RC hiccup does not skip the upload drain.
 - WinFsp volume labels cannot contain `: / \`; `volname` is derived by replacing those with `_`
