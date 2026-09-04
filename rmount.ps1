@@ -94,6 +94,7 @@ function rcd_ensure {
     # exits, so rclone's recorded parent is gone and it no longer appears under
     # this shell; the environment block is still inherited.
     $rcdPid = $null
+    $spawnMethod = $null
 
     if (Get-Command Start-Detached.exe -ErrorAction SilentlyContinue) {
         $spawnPid = $null
@@ -117,11 +118,15 @@ function rcd_ensure {
                 } catch {}
                 Start-Sleep -Milliseconds 500
             }
-            if (-not $rcdPid) {
+            if ($rcdPid) {
+                $spawnMethod = "Start-Detached.exe"
+            } else {
                 Write-Warning "rcd via Start-Detached.exe did not come up; falling back to cmd trampoline. Check log: $logFile"
                 Stop-Process -Id $spawnPid -Force -ErrorAction SilentlyContinue
             }
         }
+    } else {
+        Write-Warning "Start-Detached.exe not found in PATH; falling back to cmd trampoline (rcd will show as a child of a transient cmd.exe)."
     }
 
     if (-not $rcdPid) {
@@ -144,6 +149,7 @@ function rcd_ensure {
             } catch {}
             Start-Sleep -Milliseconds 500
         }
+        if ($rcdPid) { $spawnMethod = "cmd trampoline" }
     }
 
     if (-not $rcdPid) {
@@ -151,7 +157,7 @@ function rcd_ensure {
         return $null
     }
 
-    Write-Host "rclone rcd started (PID: $rcdPid, log: $logFile)"
+    Write-Host "rclone rcd started via $spawnMethod (PID: $rcdPid, log: $logFile)"
     return $true
 }
 
